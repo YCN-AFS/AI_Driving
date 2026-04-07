@@ -59,6 +59,12 @@ print("==================================================\n")
 # ==========================================
 # 3. VÒNG LẶP CHÍNH (ĐIỀU KHIỂN & CHỤP ẢNH)
 # ==========================================
+# ==========================================
+# 3. VÒNG LẶP CHÍNH (ĐIỀU KHIỂN & CHỤP ẢNH)
+# ==========================================
+last_key_time = 0
+active_key = 255 # 255 nghĩa là không có phím nào được bấm
+
 try:
     while True:
         ret, frame = cap.read()
@@ -66,80 +72,80 @@ try:
             print("❌ Lỗi: Bị mất tín hiệu camera!")
             break
 
-        # Resize ảnh về 320x240. 
-        # (Ảnh nhỏ giúp AI train nhanh hơn và chạy mượt hơn trên ARM64 sau này)
         frame = cv2.resize(frame, (320, 240))
         
-        # Nhận diện phím bấm (delay 50ms)
-        key = cv2.waitKey(50) & 0xFF
+        # Nhận diện phím bấm
+        key = cv2.waitKey(30) & 0xFF
         
+        # --- BỘ LỌC CHỐNG GIẬT CỤC KHI GIỮ PHÍM ---
+        if key != 255:
+            active_key = key
+            last_key_time = time.time()
+        else:
+            # Nếu hệ điều hành bị "nghỉ nhịp", giữ nguyên lệnh cũ trong 0.2 giây
+            if time.time() - last_key_time > 0.2:
+                active_key = 255
+        # ------------------------------------------
+
         current_angle = 0
         is_moving = False
 
         # --- LOGIC ĐIỀU KHIỂN ---
-        if key == ord('q'):
+        if active_key == ord('q'):
             print("Nhận lệnh thoát từ người dùng...")
             break
             
-        elif key == ord('w'):
+        elif active_key == ord('w'):
             current_angle = 0
             robot.servo_comeback_center()
             robot.drive_forward(SPEED)
             is_moving = True
             
-        elif key == ord('a'):
+        elif active_key == ord('a'):
             current_angle = -MAX_ANGLE
             robot.drive_left(MAX_ANGLE)
             robot.drive_forward(SPEED)
             is_moving = True
             
-        elif key == ord('d'):
+        elif active_key == ord('d'):
             current_angle = MAX_ANGLE
             robot.drive_right(MAX_ANGLE)
             robot.drive_forward(SPEED)
             is_moving = True
             
         else:
-            # Không bấm gì -> Phanh lại
             robot.drive_stop()
             is_moving = False
 
         # --- LOGIC GHI DỮ LIỆU ---
-        # Chỉ chụp ảnh và lưu log khi xe ĐANG DI CHUYỂN
         if is_moving:
-            # Đặt tên ảnh theo timestamp để không bao giờ bị trùng
             timestamp = str(time.time()).replace('.', '')
             img_filename = f"img_{timestamp}.jpg"
             img_filepath = os.path.join(IMG_DIR, img_filename)
             
-            # Lưu ảnh xuống ổ cứng
             cv2.imwrite(img_filepath, frame)
             
-            # Chuẩn hóa góc lái (Normalize) về khoảng [-1.0 đến 1.0]
-            # Mạng Nơ-ron (Deep Learning) học cực kỳ nhanh với các số nhỏ trong khoảng này
             normalized_angle = current_angle / float(MAX_ANGLE)
             
-            # Ghi thông số vào Excel
             with open(CSV_FILE, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([img_filename, normalized_angle, SPEED])
 
         # --- HIỂN THỊ MÀN HÌNH HUD ---
         display_frame = frame.copy()
-        
-        # Màu chữ: Xanh lá nếu đang ghi data, Đỏ nếu đang dừng
         color = (0, 255, 0) if is_moving else (0, 0, 255)
         status_text = "RECORDING" if is_moving else "PAUSED"
         
         cv2.putText(display_frame, f"Angle: {current_angle} deg", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         cv2.putText(display_frame, f"Status: {status_text}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
-        cv2.imshow("RoboGo Data Collection - CLICK HERE TO CONTROL", display_frame)
+        cv2.imshow("RoboGo Data Collection - CLICK HERE", display_frame)
 
 except Exception as e:
     print(f"❌ Đã xảy ra lỗi hệ thống: {e}")
 
 finally:
+# ... (Phần cuối giữ nguyên y hệt cũ)
     # ==========================================
     # 4. DỌN DẸP AN TOÀN
     # ==========================================
