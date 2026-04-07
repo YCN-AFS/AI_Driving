@@ -1,183 +1,306 @@
+"""
+collect_data.py
+Behavioral Cloning - Data Collection Script
+Hardware: UBTECH RoboGo on ARM64 AI Box (Linux)
+
+Controls:
+  W - Drive straight
+  A - Steer left  (smooth, incremental)
+  D - Steer right (smooth, incremental)
+  L - Quit safely
+  No key - Stop
+"""
+
 import cv2
+import csv
 import os
 import time
-import csv
+import datetime
 import numpy as np
 
-# Sử dụng thư viện điều khiển phần cứng gốc của UBTECH
 from oneai.robogo.robogo_device_solver import RoboGoDeviceSolver
 
-# ==========================================
-# 1. CẤU HÌNH THƯ MỤC LƯU TRỮ (DATASET)
-# ==========================================
-DATA_DIR = "my_dataset"
-IMG_DIR = os.path.join(DATA_DIR, "images")
-CSV_FILE = os.path.join(DATA_DIR, "driving_log.csv")
+# ─────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────
+MAX_ANGLE   = 20        # degrees, max steering lock
+SPEED       = 30        # motor speed unit
+STEER_STEP  = 4         # degrees incremented per frame while key held
+DEBOUNCE_S  = 0.20      # seconds: ignore key-release gaps shorter than this
+FRAME_W     = 320
+FRAME_H     = 240
+DATASET_DIR = "my_dataset"
+IMG_DIR     = os.path.join(DATASET_DIR, "images")
+LOG_PATH    = os.path.join(DATASET_DIR, "driving_log.csv")
 
-# Tự động tạo thư mục nếu chưa có
-if not os.path.exists(IMG_DIR):
-    os.makedirs(IMG_DIR)
+# ─────────────────────────────────────────────
+# State
+# ─────────────────────────────────────────────
+current_angle   = 0.0   # degrees, negative = left, positive = right
+last_active_key = None  # 'W', 'A', 'D', or None
+last_key_time   = 0.0   # epoch seconds of last recognised key press
+is_moving       = False # True when the robot is currently driving
+frame_count     = 0
 
-# Tạo/Mở file CSV để ghi đè hoặc nối tiếp
-with open(CSV_FILE, mode='w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(["image_path", "steering_angle", "speed"])
 
-# ==========================================
-# 2. KHỞI TẠO ĐỘNG CƠ VÀ CAMERA
-# ==========================================
-print("Đang kết nối với động cơ RoboGo...")
-robot = RoboGoDeviceSolver()
-if not robot.load():
-    print("❌ LỖI: Không thể kết nối với động cơ! Vui lòng kiểm tra lại cáp.")
-    exit()
+def setup_dirs():
+    """Create dataset directories and CSV header if needed."""
+    os.makedirs(IMG_DIR, exist_ok=True)
+    if not os.path.exists(LOG_PATH):
+        with open(LOG_PATH, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["image_filename", "steering_angle", "speed"])
 
-print("Đang khởi động Camera...")
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("❌ LỖI: Không thể mở Camera!")
-    robot.unload()
-    exit()
 
-# Thông số vật lý của xe
-SPEED = 30
-MAX_ANGLE = 20
-STEER_STEP = 4  # Gia tốc vô lăng: Tăng/giảm 4 độ mỗi nhịp giữ phím
+def normalize_angle(angle_deg: float) -> float:
+    """Map [-MAX_ANGLE, MAX_ANGLE] → [-1.0, 1.0]."""
+    return float(np.clip(angle_deg / MAX_ANGLE, -1.0, 1.0))
 
-current_angle = 0 # Biến lưu trữ góc vô lăng hiện tại
 
-print("\n==================================================")
-print(" 🚗 SẴN SÀNG THU THẬP DỮ LIỆU (SMOOTH STEERING)")
-print("==================================================")
-print("📌 LƯU Ý: Phải CLICK CHUỘT vào cửa sổ Camera để nhận phím!")
-print("🎮 ĐIỀU KHIỂN:")
-print("   - Giữ 'W': Đi thẳng (Vô lăng tự trả thẳng)")
-print("   - Giữ 'A': Cua trái (Vô lăng bẻ dần sang trái)")
-print("   - Giữ 'D': Cua phải (Vô lăng bẻ dần sang phải)")
-print("   - Buông tay: Xe tự phanh an toàn (Ngừng ghi data)")
-print("   - Phím 'Q': Thoát chương trình")
-print("==================================================\n")
+def save_frame(frame, angle_deg: float):
+    """Resize, save image, and append to CSV."""
+    resized = cv2.resize(frame, (FRAME_W, FRAME_H))
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"frame_{ts}.jpg"
+    img_path = os.path.join(IMG_DIR, filename)
+    cv2.imwrite(img_path, resized)
 
-# ==========================================
-# 3. VÒNG LẶP CHÍNH (ĐIỀU KHIỂN & CHỤP ẢNH)
-# ==========================================
-last_key_time = 0
-active_key = 255 # Mã ASCII 255 nghĩa là không bấm gì
+    norm = normalize_angle(angle_deg)
+    with open(LOG_PATH, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([filename, f"{norm:.4f}", SPEED])
 
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret: 
-            print("❌ Lỗi: Bị mất tín hiệu camera!")
-            break
+    return filename, norm
 
-        # Resize ảnh về 320x240 để model học nhanh và xe chạy mượt
-        frame = cv2.resize(frame, (320, 240))
-        
-        # Nhận diện phím bấm
-        key = cv2.waitKey(30) & 0xFF
-        
-        # --- BỘ LỌC CHỐNG GIẬT PHÍM (DEBOUNCE) ---
-        if key != 255:
-            active_key = key
-            last_key_time = time.time()
-        else:
-            # Nếu hệ điều hành lỡ ngắt tín hiệu dưới 0.2s, vẫn giữ lệnh cũ cho xe chạy mượt
-            if time.time() - last_key_time > 0.2:
-                active_key = 255
 
-        is_moving = False
+def draw_hud(frame, angle_deg: float, norm_angle: float,
+             is_moving: bool, frame_count: int, active_key: str):
+    """
+    Overlay a HUD on the given frame (in-place).
+    Layout:
+      ┌─────────────────────────────────┐
+      │ STATUS  ●RECORDING / ■ STOPPED  │
+      │ KEY     W / A / D / —           │
+      │ ANGLE   +12.0 °  [====|    ]    │
+      │ NORM    +0.60                   │
+      │ SPEED   30                      │
+      │ FRAMES  000042                  │
+      └─────────────────────────────────┘
+    """
+    h, w = frame.shape[:2]
 
-        # --- LOGIC ĐIỀU KHIỂN VÔ LĂNG MƯỢT MÀ ---
-        if active_key == ord('q'):
-            print("\nĐã nhận lệnh thoát từ người dùng!")
-            break
-            
-        elif active_key == ord('w'):
-            current_angle = 0
-            robot.servo_comeback_center()
-            robot.drive_forward(SPEED)
-            is_moving = True
-            
-        elif active_key == ord('a'):
-            current_angle -= STEER_STEP
-            if current_angle < -MAX_ANGLE: 
-                current_angle = -MAX_ANGLE
-            
-            # API của xe nhận số dương cho cả trái và phải, nên dùng abs()
-            robot.drive_left(abs(current_angle))
-            robot.drive_forward(SPEED)
-            is_moving = True
-            
-        elif active_key == ord('d'):
-            current_angle += STEER_STEP
-            if current_angle > MAX_ANGLE: 
-                current_angle = MAX_ANGLE
-                
-            robot.drive_right(abs(current_angle))
-            robot.drive_forward(SPEED)
-            is_moving = True
-            
-        else:
-            # Buông phím -> Xe dừng ngay lập tức
-            robot.drive_stop()
-            is_moving = False
+    # Semi-transparent dark panel
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (8, 8), (w - 8, 148), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
-        # --- LOGIC GHI DỮ LIỆU (CHỈ GHI KHI ĐANG CHẠY) ---
-        if is_moving:
-            timestamp = str(time.time()).replace('.', '')
-            img_filename = f"img_{timestamp}.jpg"
-            img_filepath = os.path.join(IMG_DIR, img_filename)
-            
-            cv2.imwrite(img_filepath, frame)
-            
-            # Chuẩn hóa góc lái về khoảng [-1.0, 1.0] cho Mạng Nơ-ron
-            normalized_angle = current_angle / float(MAX_ANGLE)
-            
-            with open(CSV_FILE, mode='a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([img_filename, normalized_angle, SPEED])
+    # Status indicator
+    if is_moving:
+        status_text  = "RECORDING"
+        status_color = (0, 220, 80)   # green
+        status_dot   = (0, 220, 80)
+    else:
+        status_text  = "STOPPED"
+        status_color = (60, 60, 220)  # blue-ish
+        status_dot   = (80, 80, 220)
 
-        # --- HIỂN THỊ MÀN HÌNH HUD ---
-        display_frame = frame.copy()
-        
-        # Đổi màu hiển thị: Xanh khi đang ghi, Đỏ khi đang dừng
-        color = (0, 255, 0) if is_moving else (0, 0, 255)
-        status_text = "RECORDING" if is_moving else "PAUSED"
-        
-        # In thông số lên góc trái màn hình
-        cv2.putText(display_frame, f"Angle: {current_angle} deg", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(display_frame, f"Status: {status_text}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        
-        # Vẽ một cái vô lăng ảo ở dưới đáy màn hình
-        center_x = 160
-        steering_offset = int((current_angle / MAX_ANGLE) * 100) # Biến góc lái thành pixel dịch chuyển
-        cv2.line(display_frame, (160, 220), (160, 240), (255, 255, 255), 2) # Tâm vạch mốc
-        cv2.circle(display_frame, (center_x + steering_offset, 220), 8, color, -1) # Chấm vô lăng
-        
-        cv2.imshow("RoboGo Data Collection - CLICK HERE TO CONTROL", display_frame)
+    cv2.circle(frame, (22, 24), 6, status_dot, -1)
+    cv2.putText(frame, status_text, (34, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 1, cv2.LINE_AA)
 
-except Exception as e:
-    print(f"❌ Đã xảy ra lỗi hệ thống: {e}")
+    # Key indicator
+    key_label = active_key if active_key else "—"
+    cv2.putText(frame, f"KEY    {key_label}", (16, 54),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
-finally:
-    # ==========================================
-    # 4. DỌN DẸP AN TOÀN
-    # ==========================================
-    cap.release()
-    cv2.destroyAllWindows()
-    robot.servo_comeback_center()
-    robot.drive_stop()
-    robot.unload()
-    
-    # Đếm số lượng ảnh đã gom được
+    # Steering bar  ──────[||]──────
+    bar_x, bar_y, bar_w, bar_h = 16, 62, w - 24, 14
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h),
+                  (60, 60, 60), -1)
+    mid_x = bar_x + bar_w // 2
+    # Fill from center
+    fill_w = int(abs(norm_angle) * (bar_w // 2))
+    if norm_angle < 0:  # left
+        fill_color = (220, 140, 0)   # orange-left
+        cv2.rectangle(frame,
+                      (mid_x - fill_w, bar_y),
+                      (mid_x, bar_y + bar_h),
+                      fill_color, -1)
+    else:               # right
+        fill_color = (0, 160, 220)   # blue-right
+        cv2.rectangle(frame,
+                      (mid_x, bar_y),
+                      (mid_x + fill_w, bar_y + bar_h),
+                      fill_color, -1)
+    # Center tick
+    cv2.line(frame, (mid_x, bar_y), (mid_x, bar_y + bar_h), (255, 255, 255), 1)
+
+    # Angle text
+    angle_sign = "+" if angle_deg >= 0 else ""
+    cv2.putText(frame, f"ANGLE  {angle_sign}{angle_deg:.1f} deg",
+                (16, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"NORM   {norm_angle:+.3f}",
+                (16, 113), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"SPEED  {SPEED}",
+                (16, 131), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"FRAMES {frame_count:06d}",
+                (16, 149), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # Controls reminder (bottom bar)
+    cv2.rectangle(frame, (8, h - 22), (w - 8, h - 4), (20, 20, 20), -1)
+    cv2.putText(frame, "W:fwd  A:left  D:right  L:quit",
+                (14, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                (140, 140, 140), 1, cv2.LINE_AA)
+
+    return frame
+
+
+def apply_drive(robot: RoboGoDeviceSolver,
+                key_char: str,
+                prev_angle: float) -> tuple[float, bool]:
+    """
+    Given the effective key press, update angle and send commands to robot.
+    Returns (new_angle, is_moving).
+    """
+    if key_char == 'W':
+        new_angle = 0.0
+        robot.servo_comeback_center()
+        robot.drive_forward(SPEED)
+        return new_angle, True
+
+    elif key_char == 'A':
+        new_angle = max(prev_angle - STEER_STEP, -MAX_ANGLE)
+        robot.drive_left(int(abs(new_angle)))
+        robot.drive_forward(SPEED)
+        return new_angle, True
+
+    elif key_char == 'D':
+        new_angle = min(prev_angle + STEER_STEP, MAX_ANGLE)
+        robot.drive_right(int(abs(new_angle)))
+        robot.drive_forward(SPEED)
+        return new_angle, True
+
+    else:  # None / stop
+        robot.drive_stop()
+        return prev_angle, False
+
+
+def main():
+    global frame_count
+
+    setup_dirs()
+
+    # ── Init robot ────────────────────────────────────────
+    print("[INFO] Initializing RoboGo...")
+    robot = RoboGoDeviceSolver()
+    robot.load()
+    print("[INFO] Robot loaded. Starting camera...")
+
+    # ── Init camera ───────────────────────────────────────
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Could not open camera. Exiting.")
+        robot.unload()
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    cv2.namedWindow("RoboGo Data Collector", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("RoboGo Data Collector", 640, 480)
+
+    print("[INFO] Ready. Use W/A/D to drive, L to quit.")
+    print(f"[INFO] Dataset will be saved to: {os.path.abspath(DATASET_DIR)}")
+
+    current_angle  = 0.0
+    last_active_key = None
+    last_key_time   = 0.0
+    is_moving       = False
+
     try:
-        num_images = len(os.listdir(IMG_DIR))
-        print("\n==================================================")
-        print("✅ ĐÃ TẮT ĐỘNG CƠ VÀ CAMERA AN TOÀN!")
-        print(f"📁 Tổng số ảnh thu thập được: {num_images} ảnh.")
-        print(f"💾 File log: {CSV_FILE}")
-        print("🚀 Nhớ nén thư mục 'my_dataset' rồi chép sang Pop!_OS nhé!")
-        print("==================================================")
-    except FileNotFoundError:
-        pass
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[WARN] Empty camera frame, skipping.")
+                continue
+
+            # ── Key input (30 ms poll → ~33 fps) ──────────
+            raw_key = cv2.waitKey(30) & 0xFF
+            now = time.time()
+
+            if raw_key == ord('l') or raw_key == ord('L'):
+                print("[INFO] Quit requested.")
+                break
+
+            # Map raw key → character
+            pressed_now = None
+            if   raw_key == ord('w') or raw_key == ord('W'):
+                pressed_now = 'W'
+            elif raw_key == ord('a') or raw_key == ord('A'):
+                pressed_now = 'A'
+            elif raw_key == ord('d') or raw_key == ord('D'):
+                pressed_now = 'D'
+            # raw_key == 255 means no key (cv2 timeout)
+
+            # ── Debounce: ignore momentary "no-key" gaps ──
+            # If we had an active key and suddenly see no key,
+            # keep the last active key alive for DEBOUNCE_S seconds.
+            if pressed_now is not None:
+                last_active_key = pressed_now
+                last_key_time   = now
+                effective_key   = pressed_now
+            else:
+                # No key pressed this frame
+                if last_active_key is not None:
+                    gap = now - last_key_time
+                    if gap < DEBOUNCE_S:
+                        # Within debounce window → treat as still held
+                        effective_key = last_active_key
+                    else:
+                        # Gap exceeded → genuinely released
+                        effective_key   = None
+                        last_active_key = None
+                else:
+                    effective_key = None
+
+            # ── Apply drive command ────────────────────────
+            current_angle, is_moving = apply_drive(
+                robot, effective_key, current_angle
+            )
+
+            # ── Data collection ───────────────────────────
+            if is_moving:
+                filename, norm = save_frame(frame, current_angle)
+                frame_count += 1
+                # Lightweight console feedback every 50 frames
+                if frame_count % 50 == 0:
+                    print(f"[DATA] {frame_count} frames saved. "
+                          f"Last: {filename}  angle={norm:+.3f}")
+
+            # ── HUD overlay ───────────────────────────────
+            norm_angle = normalize_angle(current_angle)
+            display = draw_hud(
+                frame.copy(),
+                current_angle,
+                norm_angle,
+                is_moving,
+                frame_count,
+                effective_key
+            )
+            cv2.imshow("RoboGo Data Collector", display)
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by Ctrl+C.")
+
+    finally:
+        print("[INFO] Stopping robot and releasing resources...")
+        robot.drive_stop()
+        robot.unload()
+        cap.release()
+        cv2.destroyAllWindows()
+        print(f"[INFO] Collection complete. Total frames saved: {frame_count}")
+        print(f"[INFO] Dataset location: {os.path.abspath(DATASET_DIR)}")
+
+
+if __name__ == "__main__":
+    main()
