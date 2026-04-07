@@ -7,7 +7,7 @@ Controls:
   W - Drive straight
   A - Steer left  (smooth, incremental)
   D - Steer right (smooth, incremental)
-  L - Quit safely
+  Q - Quit safely
   No key - Stop
 """
 
@@ -17,6 +17,7 @@ import os
 import time
 import datetime
 import numpy as np
+from typing import Tuple
 
 from oneai.robogo.robogo_device_solver import RoboGoDeviceSolver
 
@@ -148,7 +149,7 @@ def draw_hud(frame, angle_deg: float, norm_angle: float,
 
     # Controls reminder (bottom bar)
     cv2.rectangle(frame, (8, h - 22), (w - 8, h - 4), (20, 20, 20), -1)
-    cv2.putText(frame, "W:fwd  A:left  D:right  L:quit",
+    cv2.putText(frame, "W:fwd  A:left  D:right  ESC:quit",
                 (14, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                 (140, 140, 140), 1, cv2.LINE_AA)
 
@@ -157,7 +158,7 @@ def draw_hud(frame, angle_deg: float, norm_angle: float,
 
 def apply_drive(robot: RoboGoDeviceSolver,
                 key_char: str,
-                prev_angle: float) -> tuple[float, bool]:
+                prev_angle: float) -> Tuple[float, bool]:
     """
     Given the effective key press, update angle and send commands to robot.
     Returns (new_angle, is_moving).
@@ -209,7 +210,7 @@ def main():
     cv2.namedWindow("RoboGo Data Collector", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("RoboGo Data Collector", 640, 480)
 
-    print("[INFO] Ready. Use W/A/D to drive, L to quit.")
+    print("[INFO] Ready. Use W/A/D to drive, Q to quit.")
     print(f"[INFO] Dataset will be saved to: {os.path.abspath(DATASET_DIR)}")
 
     current_angle  = 0.0
@@ -228,7 +229,7 @@ def main():
             raw_key = cv2.waitKey(30) & 0xFF
             now = time.time()
 
-            if raw_key == ord('l') or raw_key == ord('L'):
+            if raw_key == 27:  # ESC
                 print("[INFO] Quit requested.")
                 break
 
