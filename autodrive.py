@@ -1,14 +1,15 @@
 """
 autodrive.py
 ============
-Behavioral Cloning – Autonomous Inference Script
-Hardware  : UBTECH RoboGo on NVIDIA Jetson Nano (ARM64, JetPack 4.6)
+Real-time Autonomous Driving – Behavioral Cloning Inference
+Hardware  : UBTECH RoboGo RC Car · NVIDIA Jetson Nano (JetPack 4.6)
 Model     : NVIDIA PilotNet (trained via train_model.py)
-Weights   : robogo_pilotnet.pth
 
-Controls (OpenCV window must be in focus):
-  Q / ESC  – Safe quit
-  Any key  – (display only, car is fully autonomous)
+Usage
+-----
+    python3 autodrive.py
+
+Press 'Q' on the OpenCV preview window to safely stop the car.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,328 +25,268 @@ from PIL import Image
 import torch
 import torchvision.transforms as T
 
-# Proprietary RoboGo control API
-from oneai.robogo.robogo_device_solver import RoboGoDeviceSolver
-
-# PilotNet architecture (defined in same directory)
+# ── Project model architecture ────────────────────────────────────────────────
 from train_model import PilotNet
 
+# ── Proprietary RoboGo motor/servo API ────────────────────────────────────────
+from oneai.robogo.robogo_device_solver import RoboGoDeviceSolver
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants  (must match collect_data.py and train_model.py exactly)
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
-WEIGHTS_PATH  = "robogo_pilotnet.pth"   # path to trained checkpoint
-MAX_ANGLE     = 20                       # degrees – matches training normalisation
-SPEED         = 30                       # motor speed unit
-DEADZONE_DEG  = 1.0                      # ± degrees; go straight within this band
+MODEL_PATH = "robogo_pilotnet.pth"          # trained checkpoint
 
-DISPLAY_W     = 320                      # HUD preview width  (pixels)
-DISPLAY_H     = 240                      # HUD preview height (pixels)
+MAX_ANGLE  = 20         # max steering angle in degrees (hardware limit)
+SPEED      = 30         # forward drive speed sent to motors
+DEADZONE   = 1.0        # ±degrees – within this band, drive straight
 
-# PilotNet canonical input size – MUST match train_model.py  IMG_H × IMG_W
-MODEL_H       = 66
-MODEL_W       = 200
+CAMERA_ID  = 0          # /dev/video0
+DISPLAY_W  = 320        # HUD preview width
+DISPLAY_H  = 240        # HUD preview height
 
-# ImageNet statistics – identical to training pipeline
-MEAN          = [0.485, 0.456, 0.406]
-STD           = [0.229, 0.224, 0.225]
+# PilotNet canonical input (must match training pipeline in train_model.py)
+IMG_W, IMG_H = 200, 66
+
+# ImageNet normalisation (same as training)
+MEAN = [0.485, 0.456, 0.406]
+STD  = [0.229, 0.224, 0.225]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Device selection – prefer GPU (CUDA) on Jetson Nano
+# ─────────────────────────────────────────────────────────────────────────────
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Preprocessing transform  (mirrors DrivingDataset._base_tf in train_model.py)
+# Preprocessing transform (mirrors training _base_tf exactly)
 # ─────────────────────────────────────────────────────────────────────────────
 preprocess = T.Compose([
-    T.Resize((MODEL_H, MODEL_W)),   # torchvision uses (H, W) — correct order
-    T.ToTensor(),                    # uint8 [0,255] → float32 [0,1]
+    T.Resize((IMG_H, IMG_W)),   # (Height, Width) – torchvision convention
+    T.ToTensor(),               # HWC uint8 [0,255] → CHW float32 [0,1]
     T.Normalize(mean=MEAN, std=STD),
 ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: load model from checkpoint
+# Helper – load model
 # ─────────────────────────────────────────────────────────────────────────────
-def load_model(weights_path: str, device: torch.device) -> torch.nn.Module:
+def load_model(path: str) -> PilotNet:
     """
-    Instantiate PilotNet, load weights from the 'model_state' key inside
-    the checkpoint dict, move to device, and set to eval mode.
+    Instantiate PilotNet, load trained weights from checkpoint, move to
+    GPU and switch to eval mode (disables dropout / batchnorm running stats).
     """
-    print(f"[INFO] Loading checkpoint: {weights_path}")
-    checkpoint = torch.load(weights_path, map_location=device)
+    model = PilotNet()
 
-    if "model_state" not in checkpoint:
-        raise KeyError(
-            f"[ERROR] Key 'model_state' not found in checkpoint. "
-            f"Available keys: {list(checkpoint.keys())}"
-        )
-
-    model = PilotNet(dropout_p=0.1)
+    checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model_state"])
+
     model.to(device)
     model.eval()
 
-    saved_epoch = checkpoint.get("epoch", "?")
-    saved_loss  = checkpoint.get("val_loss", float("nan"))
-    print(f"[INFO] Weights loaded  — saved epoch: {saved_epoch}  "
-          f"| best val MSE: {saved_loss:.6f}")
+    print(f"[INFO] Model loaded from '{path}'")
+    print(f"[INFO] Checkpoint epoch  : {checkpoint.get('epoch', '?')}")
+    print(f"[INFO] Checkpoint val MSE: {checkpoint.get('val_loss', '?')}")
     return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: frame → tensor on device
+# Helper – preprocess a single BGR frame from the camera
 # ─────────────────────────────────────────────────────────────────────────────
-def frame_to_tensor(bgr_frame: np.ndarray,
-                    device: torch.device) -> torch.Tensor:
+@torch.no_grad()
+def predict_steering(model: PilotNet, frame_bgr: np.ndarray) -> float:
     """
-    Convert an OpenCV BGR frame to a normalised (1, 3, 66, 200) CUDA tensor.
+    Convert a raw BGR frame to the tensor format expected by PilotNet,
+    run a forward pass on the GPU, and return the predicted steering
+    angle in degrees (range ≈ [-MAX_ANGLE, +MAX_ANGLE]).
+    """
+    # BGR → RGB (OpenCV reads BGR, PyTorch/PIL expect RGB)
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-    Pipeline:
-      1. BGR → RGB  (OpenCV reads BGR; the model was trained on RGB PIL images)
-      2. numpy → PIL Image
-      3. Resize to (MODEL_H, MODEL_W) = (66, 200)
-      4. ToTensor  → [0, 1] float32
-      5. Normalise with ImageNet stats
-      6. unsqueeze(0)  → add batch dimension
-      7. Move to device
-    """
-    rgb   = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-    pil   = Image.fromarray(rgb)
-    tensor = preprocess(pil)          # shape: (3, 66, 200)
-    tensor = tensor.unsqueeze(0)      # shape: (1, 3, 66, 200)
-    return tensor.to(device)
+    # NumPy → PIL Image (required by torchvision transforms)
+    pil_img = Image.fromarray(frame_rgb)
+
+    # Apply the exact same transforms used during training
+    tensor = preprocess(pil_img)            # shape: (3, 66, 200)
+    tensor = tensor.unsqueeze(0)            # add batch dim → (1, 3, 66, 200)
+    tensor = tensor.to(device)              # move to GPU
+
+    # Forward pass (inference – no gradient computation)
+    output = model(tensor)                  # shape: (1, 1)
+    normalised_angle = output.item()        # scalar in ≈ [-1, 1]
+
+    # Scale to real steering angle in degrees
+    steering_angle = normalised_angle * MAX_ANGLE
+    return steering_angle
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: apply steering prediction to robot
+# Helper – send motor commands based on predicted angle
 # ─────────────────────────────────────────────────────────────────────────────
-def apply_steering(robot: RoboGoDeviceSolver,
-                   angle_deg: float) -> str:
+def execute_steering(robot: RoboGoDeviceSolver, angle: float) -> str:
     """
-    Translate a steering angle (degrees, signed) into robot API commands.
+    Translate a steering angle (degrees) into RoboGo API calls.
 
-    Returns a short label string for the HUD.
+    Returns a human-readable label for the HUD overlay.
     """
-    if abs(angle_deg) <= DEADZONE_DEG:
-        # Deadzone → drive perfectly straight, suppress servo jitter
+    if abs(angle) <= DEADZONE:
+        # ── Straight ──────────────────────────────────────────────────────
         robot.servo_comeback_center()
         robot.drive_forward(SPEED)
         return "STRAIGHT"
-
-    elif angle_deg < 0:
-        # Negative = left
-        robot.drive_left(int(abs(angle_deg)))
+    elif angle < 0:
+        # ── Left turn ─────────────────────────────────────────────────────
+        robot.drive_left(abs(angle))        # API accepts positive values only
         robot.drive_forward(SPEED)
-        return f"LEFT  {abs(angle_deg):.1f} deg"
-
+        return "LEFT"
     else:
-        # Positive = right
-        robot.drive_right(int(angle_deg))
+        # ── Right turn ────────────────────────────────────────────────────
+        robot.drive_right(abs(angle))       # API accepts positive values only
         robot.drive_forward(SPEED)
-        return f"RIGHT {angle_deg:.1f} deg"
+        return "RIGHT"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: draw HUD overlay on display frame
+# Helper – draw HUD overlay on the display frame
 # ─────────────────────────────────────────────────────────────────────────────
-def draw_hud(frame: np.ndarray,
-             angle_deg: float,
-             direction_label: str,
-             fps: float,
-             frame_idx: int) -> np.ndarray:
+def draw_hud(frame: np.ndarray, angle: float, direction: str, fps: float):
     """
-    Draws a semi-transparent HUD panel with:
-      • AUTOPILOT: ON  (green)
-      • Steering bar   (orange = left, blue = right)
-      • Numeric angle + direction label
-      • FPS counter
-      • Frame counter
-      • Bottom controls reminder
-    Modifies `frame` in-place and returns it.
+    Overlay steering info and status text onto the preview frame.
     """
-    h, w = frame.shape[:2]
-    norm_angle = float(np.clip(angle_deg / MAX_ANGLE, -1.0, 1.0))
+    # ── Background bar at the top for readability ─────────────────────────
+    cv2.rectangle(frame, (0, 0), (DISPLAY_W, 60), (0, 0, 0), cv2.FILLED)
 
-    # ── Semi-transparent dark info panel (top) ────────────────────────────
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (8, 8), (w - 8, 162), (15, 15, 15), -1)
-    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+    # ── "AUTOPILOT: ON" in green ──────────────────────────────────────────
+    cv2.putText(
+        frame, "AUTOPILOT: ON",
+        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+        (0, 255, 0), 2, cv2.LINE_AA,
+    )
 
-    # ── AUTOPILOT status (green) ──────────────────────────────────────────
-    cv2.circle(frame, (22, 26), 7, (0, 220, 70), -1)
-    cv2.putText(frame, "AUTOPILOT: ON",
-                (36, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
-                (0, 230, 80), 1, cv2.LINE_AA)
+    # ── Steering angle + direction ────────────────────────────────────────
+    angle_text = f"Angle: {angle:+6.2f} deg  [{direction}]"
+    cv2.putText(
+        frame, angle_text,
+        (10, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+        (255, 255, 255), 1, cv2.LINE_AA,
+    )
 
-    # ── Steering bar ──────────────────────────────────────────────────────
-    bar_x, bar_y = 16, 42
-    bar_w, bar_h = w - 24, 14
-    cv2.rectangle(frame,
-                  (bar_x, bar_y),
-                  (bar_x + bar_w, bar_y + bar_h),
-                  (55, 55, 55), -1)
-    mid_x = bar_x + bar_w // 2
-    fill_w = int(abs(norm_angle) * (bar_w // 2))
-
-    if norm_angle < 0:                          # left → orange
-        cv2.rectangle(frame,
-                      (mid_x - fill_w, bar_y),
-                      (mid_x, bar_y + bar_h),
-                      (0, 140, 255), -1)
-    else:                                       # right → blue
-        cv2.rectangle(frame,
-                      (mid_x, bar_y),
-                      (mid_x + fill_w, bar_y + bar_h),
-                      (220, 120, 0), -1)
-
-    # Centre tick
-    cv2.line(frame, (mid_x, bar_y), (mid_x, bar_y + bar_h),
-             (255, 255, 255), 1)
-
-    # ── Text rows ─────────────────────────────────────────────────────────
-    angle_sign = "+" if angle_deg >= 0 else ""
-    rows = [
-        f"ANGLE   {angle_sign}{angle_deg:.2f} deg",
-        f"ACTION  {direction_label}",
-        f"FPS     {fps:.1f}",
-        f"FRAMES  {frame_idx:06d}",
-    ]
-    for i, text in enumerate(rows):
-        y = 76 + i * 20
-        cv2.putText(frame, text,
-                    (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44,
-                    (195, 195, 195), 1, cv2.LINE_AA)
-
-    # ── Bottom controls reminder ──────────────────────────────────────────
-    cv2.rectangle(frame, (8, h - 22), (w - 8, h - 4), (15, 15, 15), -1)
-    cv2.putText(frame, "Q / ESC : quit  |  window must be focused",
-                (14, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.37,
-                (130, 130, 130), 1, cv2.LINE_AA)
-
-    return frame
+    # ── FPS counter (bottom-right) ────────────────────────────────────────
+    fps_text = f"{fps:.1f} FPS"
+    cv2.putText(
+        frame, fps_text,
+        (DISPLAY_W - 95, DISPLAY_H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+        (0, 255, 255), 1, cv2.LINE_AA,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main inference loop
+# Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    # ── Device selection ──────────────────────────────────────────────────
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[INFO] Inference device : {device}")
-    if device.type == 'cuda':
-        print(f"       GPU  : {torch.cuda.get_device_name(0)}")
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"       VRAM : {vram_gb:.1f} GB")
-    else:
-        print("[WARN] CUDA not available – running on CPU (will be slow).")
+    print("=" * 60)
+    print("  RoboGo AutoPilot – PilotNet Inference")
+    print("=" * 60)
+    print(f"[INFO] Device    : {device}")
+    if device.type == "cuda":
+        print(f"[INFO] GPU       : {torch.cuda.get_device_name(0)}")
+    print(f"[INFO] Max angle : {MAX_ANGLE}°")
+    print(f"[INFO] Speed     : {SPEED}")
+    print(f"[INFO] Deadzone  : ±{DEADZONE}°")
+    print()
 
     # ── Load model ────────────────────────────────────────────────────────
-    try:
-        model = load_model(WEIGHTS_PATH, device)
-    except (FileNotFoundError, KeyError) as exc:
-        print(f"[FATAL] {exc}")
-        sys.exit(1)
+    model = load_model(MODEL_PATH)
 
-    # ── Enable cuDNN benchmark for fixed-size inference throughput ────────
-    if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = True
-
-    # ── Warm up GPU (avoids first-frame latency spike) ────────────────────
-    if device.type == 'cuda':
-        print("[INFO] Warming up GPU inference pipeline...")
-        dummy = torch.zeros(1, 3, MODEL_H, MODEL_W, device=device)
-        with torch.no_grad():
-            for _ in range(5):
-                _ = model(dummy)
-        torch.cuda.synchronize()
-        print("[INFO] GPU warm-up complete.")
-
-    # ── Init robot ────────────────────────────────────────────────────────
-    print("[INFO] Initializing RoboGo robot...")
+    # ── Initialise robot ──────────────────────────────────────────────────
+    print("[INFO] Initialising RoboGo hardware…")
     robot = RoboGoDeviceSolver()
     robot.load()
-    print("[INFO] Robot loaded and ready.")
+    print("[INFO] RoboGo loaded and ready.")
 
-    # ── Init camera ───────────────────────────────────────────────────────
-    print("[INFO] Opening camera (index 0)...")
-    cap = cv2.VideoCapture(0)
+    # ── Open camera ───────────────────────────────────────────────────────
+    cap = cv2.VideoCapture(CAMERA_ID)
     if not cap.isOpened():
-        print("[FATAL] Could not open camera. Shutting down.")
+        print("[ERROR] Cannot open camera! Exiting.")
         robot.drive_stop()
         robot.unload()
         sys.exit(1)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    print(f"[INFO] Camera {CAMERA_ID} opened.")
+    print("[INFO] Press 'Q' on the preview window to stop.\n")
 
-    cv2.namedWindow("RoboGo AutoDrive", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("RoboGo AutoDrive", DISPLAY_W, DISPLAY_H)
-
-    print("[INFO] Autopilot active.  Press Q or ESC in the window to quit.")
-    print("=" * 55)
-
-    # ── Runtime state ─────────────────────────────────────────────────────
-    frame_idx  = 0
-    fps        = 0.0
-    fps_timer  = time.time()
-
-    # ── Main loop ─────────────────────────────────────────────────────────
+    # ── Inference loop ────────────────────────────────────────────────────
     try:
+        frame_count = 0
+        fps = 0.0
+        t_start = time.time()
+
         while True:
-            # ── Grab frame ────────────────────────────────────────────────
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                print("[WARN] Empty camera frame – skipping.")
+            ret, frame_bgr = cap.read()
+            if not ret:
+                print("[WARN] Failed to grab frame – retrying…")
                 continue
 
-            # ── Inference ─────────────────────────────────────────────────
-            tensor = frame_to_tensor(frame, device)
+            # ── Predict steering angle ────────────────────────────────────
+            angle = predict_steering(model, frame_bgr)
 
-            with torch.no_grad():
-                prediction = model(tensor)           # shape: (1, 1)
+            # Clamp to hardware limits (safety)
+            angle = max(-MAX_ANGLE, min(MAX_ANGLE, angle))
 
-            # Denormalise: [-1, 1] → [-MAX_ANGLE, MAX_ANGLE] degrees
-            norm_angle = float(prediction.item())
-            norm_angle = float(np.clip(norm_angle, -1.0, 1.0))   # safety clamp
-            angle_deg  = norm_angle * MAX_ANGLE
+            # ── Send commands to motors ───────────────────────────────────
+            direction = execute_steering(robot, angle)
 
-            # ── Robot control with deadzone ────────────────────────────────
-            direction_label = apply_steering(robot, angle_deg)
+            # ── FPS calculation ───────────────────────────────────────────
+            frame_count += 1
+            elapsed = time.time() - t_start
+            if elapsed >= 1.0:
+                fps = frame_count / elapsed
+                frame_count = 0
+                t_start = time.time()
 
-            # ── FPS calculation (rolling 30-frame average) ─────────────────
-            frame_idx += 1
-            if frame_idx % 30 == 0:
-                now      = time.time()
-                fps      = 30.0 / max(now - fps_timer, 1e-6)
-                fps_timer = now
-                print(f"[DRIVE] frame={frame_idx:06d}  "
-                      f"angle={angle_deg:+6.2f} deg  "
-                      f"({direction_label:20s})  "
-                      f"fps={fps:.1f}")
+            # ── HUD display ───────────────────────────────────────────────
+            display_frame = cv2.resize(frame_bgr, (DISPLAY_W, DISPLAY_H))
+            draw_hud(display_frame, angle, direction, fps)
 
-            # ── HUD overlay ───────────────────────────────────────────────
-            display = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
-            display = draw_hud(display, angle_deg, direction_label,
-                                fps, frame_idx)
-            cv2.imshow("RoboGo AutoDrive", display)
+            cv2.imshow("RoboGo AutoPilot", display_frame)
 
-            # ── Key input (1 ms poll – keep GUI responsive) ────────────────
+            # ── Quit on 'Q' ──────────────────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), ord('Q'), 27):   # Q or ESC
-                print("[INFO] Quit requested by user.")
+            if key == ord("q") or key == ord("Q"):
+                print("\n[INFO] 'Q' pressed – stopping autopilot…")
                 break
 
     except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by Ctrl+C.")
+        print("\n[INFO] KeyboardInterrupt – stopping autopilot…")
+
+    except Exception as exc:
+        print(f"\n[ERROR] Unexpected error: {exc}")
 
     finally:
-        # ── CRITICAL: always stop motors before exit ───────────────────────
-        print("[INFO] Stopping robot...")
-        robot.drive_stop()
-        print("[INFO] Unloading robot...")
-        robot.unload()
-        print("[INFO] Releasing camera...")
-        cap.release()
+        # ── CRITICAL CLEANUP ──────────────────────────────────────────────
+        # Always stop the car, release hardware, and close windows
+        # regardless of how the loop terminated (normal, crash, Ctrl-C).
+        print("[INFO] Cleaning up…")
+
+        try:
+            robot.drive_stop()
+            print("[INFO] Motors stopped.")
+        except Exception as e:
+            print(f"[WARN] Failed to stop motors: {e}")
+
+        try:
+            robot.unload()
+            print("[INFO] RoboGo unloaded.")
+        except Exception as e:
+            print(f"[WARN] Failed to unload robot: {e}")
+
+        try:
+            cap.release()
+            print("[INFO] Camera released.")
+        except Exception as e:
+            print(f"[WARN] Failed to release camera: {e}")
+
         cv2.destroyAllWindows()
-        print(f"[INFO] Autopilot session ended. Total frames processed: {frame_idx}")
+        print("[INFO] Autopilot terminated safely. Goodbye!")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
