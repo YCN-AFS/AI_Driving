@@ -1,149 +1,353 @@
+"""
+autodrive.py
+============
+Behavioral Cloning – Autonomous Inference Script
+Hardware  : UBTECH RoboGo on NVIDIA Jetson Nano (ARM64, JetPack 4.6)
+Model     : NVIDIA PilotNet (trained via train_model.py)
+Weights   : robogo_pilotnet.pth
+
+Controls (OpenCV window must be in focus):
+  Q / ESC  – Safe quit
+  Any key  – (display only, car is fully autonomous)
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Imports
+# ─────────────────────────────────────────────────────────────────────────────
+import sys
+import time
+
 import cv2
+import numpy as np
+from PIL import Image
+
 import torch
 import torchvision.transforms as T
-from PIL import Image
-import numpy as np
 
-# ==========================================
-# 1. IMPORT THƯ VIỆN ĐIỀU KHIỂN & MODEL
-# ==========================================
+# Proprietary RoboGo control API
 from oneai.robogo.robogo_device_solver import RoboGoDeviceSolver
 
-try:
-    from train_model import PilotNet
-except ImportError:
-    print("❌ LỖI: Không tìm thấy file train_model.py trong cùng thư mục!")
-    print("Hãy copy file train_model.py từ máy Pop!_OS sang đây.")
-    exit()
+# PilotNet architecture (defined in same directory)
+from train_model import PilotNet
 
-# ==========================================
-# 2. CẤU HÌNH THÔNG SỐ (HYPERPARAMETERS)
-# ==========================================
-MAX_ANGLE = 20          # Biên độ vô lăng tối đa (độ)
-SPEED = 30              # Tốc độ động cơ
-DEADZONE = 1.0          # Dung sai: Góc lệch dưới 1 độ sẽ bị ép đi thẳng để chống lắc
-MODEL_PATH = "robogo_pilotnet.pth"
 
-def main():
-    # --- KHỞI TẠO AI TRÊN GPU ---
-    print("[INFO] Đang kiểm tra sức mạnh phần cứng...")
-    # Ưu tiên lấy CUDA (GPU Jetson Nano), nếu không có mới chịu xài CPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[INFO] 🧠 Thiết bị xử lý AI: {device}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants  (must match collect_data.py and train_model.py exactly)
+# ─────────────────────────────────────────────────────────────────────────────
+WEIGHTS_PATH  = "robogo_pilotnet.pth"   # path to trained checkpoint
+MAX_ANGLE     = 20                       # degrees – matches training normalisation
+SPEED         = 30                       # motor speed unit
+DEADZONE_DEG  = 1.0                      # ± degrees; go straight within this band
 
-    print("[INFO] Đang nạp mạng Nơ-ron PilotNet...")
-    model = PilotNet()
-    try:
-        checkpoint = torch.load(MODEL_PATH, map_location=device)
-        model.load_state_dict(checkpoint['model_state'])
-    except Exception as e:
-        print(f"❌ LỖI NẠP MODEL: {e}")
-        exit()
+DISPLAY_W     = 320                      # HUD preview width  (pixels)
+DISPLAY_H     = 240                      # HUD preview height (pixels)
 
-    # Đẩy model lên GPU và chuyển sang chế độ làm việc (không học)
+# PilotNet canonical input size – MUST match train_model.py  IMG_H × IMG_W
+MODEL_H       = 66
+MODEL_W       = 200
+
+# ImageNet statistics – identical to training pipeline
+MEAN          = [0.485, 0.456, 0.406]
+STD           = [0.229, 0.224, 0.225]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Preprocessing transform  (mirrors DrivingDataset._base_tf in train_model.py)
+# ─────────────────────────────────────────────────────────────────────────────
+preprocess = T.Compose([
+    T.Resize((MODEL_H, MODEL_W)),   # torchvision uses (H, W) — correct order
+    T.ToTensor(),                    # uint8 [0,255] → float32 [0,1]
+    T.Normalize(mean=MEAN, std=STD),
+])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: load model from checkpoint
+# ─────────────────────────────────────────────────────────────────────────────
+def load_model(weights_path: str, device: torch.device) -> torch.nn.Module:
+    """
+    Instantiate PilotNet, load weights from the 'model_state' key inside
+    the checkpoint dict, move to device, and set to eval mode.
+    """
+    print(f"[INFO] Loading checkpoint: {weights_path}")
+    checkpoint = torch.load(weights_path, map_location=device)
+
+    if "model_state" not in checkpoint:
+        raise KeyError(
+            f"[ERROR] Key 'model_state' not found in checkpoint. "
+            f"Available keys: {list(checkpoint.keys())}"
+        )
+
+    model = PilotNet(dropout_p=0.1)
+    model.load_state_dict(checkpoint["model_state"])
     model.to(device)
     model.eval()
 
-    # Pipeline tiền xử lý ảnh giống hệt lúc Train
-    transform = T.Compose([
-        T.Resize((66, 200)), # PyTorch Resize dùng (Height, Width)
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    print("✅ Đã nạp thành công bộ não AI!")
+    saved_epoch = checkpoint.get("epoch", "?")
+    saved_loss  = checkpoint.get("val_loss", float("nan"))
+    print(f"[INFO] Weights loaded  — saved epoch: {saved_epoch}  "
+          f"| best val MSE: {saved_loss:.6f}")
+    return model
 
-    # --- KHỞI TẠO ĐỘNG CƠ & CAMERA ---
-    print("[INFO] Đang kết nối với động cơ RoboGo...")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: frame → tensor on device
+# ─────────────────────────────────────────────────────────────────────────────
+def frame_to_tensor(bgr_frame: np.ndarray,
+                    device: torch.device) -> torch.Tensor:
+    """
+    Convert an OpenCV BGR frame to a normalised (1, 3, 66, 200) CUDA tensor.
+
+    Pipeline:
+      1. BGR → RGB  (OpenCV reads BGR; the model was trained on RGB PIL images)
+      2. numpy → PIL Image
+      3. Resize to (MODEL_H, MODEL_W) = (66, 200)
+      4. ToTensor  → [0, 1] float32
+      5. Normalise with ImageNet stats
+      6. unsqueeze(0)  → add batch dimension
+      7. Move to device
+    """
+    rgb   = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+    pil   = Image.fromarray(rgb)
+    tensor = preprocess(pil)          # shape: (3, 66, 200)
+    tensor = tensor.unsqueeze(0)      # shape: (1, 3, 66, 200)
+    return tensor.to(device)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: apply steering prediction to robot
+# ─────────────────────────────────────────────────────────────────────────────
+def apply_steering(robot: RoboGoDeviceSolver,
+                   angle_deg: float) -> str:
+    """
+    Translate a steering angle (degrees, signed) into robot API commands.
+
+    Returns a short label string for the HUD.
+    """
+    if abs(angle_deg) <= DEADZONE_DEG:
+        # Deadzone → drive perfectly straight, suppress servo jitter
+        robot.servo_comeback_center()
+        robot.drive_forward(SPEED)
+        return "STRAIGHT"
+
+    elif angle_deg < 0:
+        # Negative = left
+        robot.drive_left(int(abs(angle_deg)))
+        robot.drive_forward(SPEED)
+        return f"LEFT  {abs(angle_deg):.1f} deg"
+
+    else:
+        # Positive = right
+        robot.drive_right(int(angle_deg))
+        robot.drive_forward(SPEED)
+        return f"RIGHT {angle_deg:.1f} deg"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: draw HUD overlay on display frame
+# ─────────────────────────────────────────────────────────────────────────────
+def draw_hud(frame: np.ndarray,
+             angle_deg: float,
+             direction_label: str,
+             fps: float,
+             frame_idx: int) -> np.ndarray:
+    """
+    Draws a semi-transparent HUD panel with:
+      • AUTOPILOT: ON  (green)
+      • Steering bar   (orange = left, blue = right)
+      • Numeric angle + direction label
+      • FPS counter
+      • Frame counter
+      • Bottom controls reminder
+    Modifies `frame` in-place and returns it.
+    """
+    h, w = frame.shape[:2]
+    norm_angle = float(np.clip(angle_deg / MAX_ANGLE, -1.0, 1.0))
+
+    # ── Semi-transparent dark info panel (top) ────────────────────────────
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (8, 8), (w - 8, 162), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    # ── AUTOPILOT status (green) ──────────────────────────────────────────
+    cv2.circle(frame, (22, 26), 7, (0, 220, 70), -1)
+    cv2.putText(frame, "AUTOPILOT: ON",
+                (36, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                (0, 230, 80), 1, cv2.LINE_AA)
+
+    # ── Steering bar ──────────────────────────────────────────────────────
+    bar_x, bar_y = 16, 42
+    bar_w, bar_h = w - 24, 14
+    cv2.rectangle(frame,
+                  (bar_x, bar_y),
+                  (bar_x + bar_w, bar_y + bar_h),
+                  (55, 55, 55), -1)
+    mid_x = bar_x + bar_w // 2
+    fill_w = int(abs(norm_angle) * (bar_w // 2))
+
+    if norm_angle < 0:                          # left → orange
+        cv2.rectangle(frame,
+                      (mid_x - fill_w, bar_y),
+                      (mid_x, bar_y + bar_h),
+                      (0, 140, 255), -1)
+    else:                                       # right → blue
+        cv2.rectangle(frame,
+                      (mid_x, bar_y),
+                      (mid_x + fill_w, bar_y + bar_h),
+                      (220, 120, 0), -1)
+
+    # Centre tick
+    cv2.line(frame, (mid_x, bar_y), (mid_x, bar_y + bar_h),
+             (255, 255, 255), 1)
+
+    # ── Text rows ─────────────────────────────────────────────────────────
+    angle_sign = "+" if angle_deg >= 0 else ""
+    rows = [
+        f"ANGLE   {angle_sign}{angle_deg:.2f} deg",
+        f"ACTION  {direction_label}",
+        f"FPS     {fps:.1f}",
+        f"FRAMES  {frame_idx:06d}",
+    ]
+    for i, text in enumerate(rows):
+        y = 76 + i * 20
+        cv2.putText(frame, text,
+                    (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+                    (195, 195, 195), 1, cv2.LINE_AA)
+
+    # ── Bottom controls reminder ──────────────────────────────────────────
+    cv2.rectangle(frame, (8, h - 22), (w - 8, h - 4), (15, 15, 15), -1)
+    cv2.putText(frame, "Q / ESC : quit  |  window must be focused",
+                (14, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.37,
+                (130, 130, 130), 1, cv2.LINE_AA)
+
+    return frame
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main inference loop
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    # ── Device selection ──────────────────────────────────────────────────
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[INFO] Inference device : {device}")
+    if device.type == 'cuda':
+        print(f"       GPU  : {torch.cuda.get_device_name(0)}")
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"       VRAM : {vram_gb:.1f} GB")
+    else:
+        print("[WARN] CUDA not available – running on CPU (will be slow).")
+
+    # ── Load model ────────────────────────────────────────────────────────
+    try:
+        model = load_model(WEIGHTS_PATH, device)
+    except (FileNotFoundError, KeyError) as exc:
+        print(f"[FATAL] {exc}")
+        sys.exit(1)
+
+    # ── Enable cuDNN benchmark for fixed-size inference throughput ────────
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+
+    # ── Warm up GPU (avoids first-frame latency spike) ────────────────────
+    if device.type == 'cuda':
+        print("[INFO] Warming up GPU inference pipeline...")
+        dummy = torch.zeros(1, 3, MODEL_H, MODEL_W, device=device)
+        with torch.no_grad():
+            for _ in range(5):
+                _ = model(dummy)
+        torch.cuda.synchronize()
+        print("[INFO] GPU warm-up complete.")
+
+    # ── Init robot ────────────────────────────────────────────────────────
+    print("[INFO] Initializing RoboGo robot...")
     robot = RoboGoDeviceSolver()
-    if not robot.load():
-        print("❌ LỖI: Không thể kết nối với mạch điều khiển động cơ!")
-        exit()
+    robot.load()
+    print("[INFO] Robot loaded and ready.")
 
-    print("[INFO] Đang khởi động Camera...")
+    # ── Init camera ───────────────────────────────────────────────────────
+    print("[INFO] Opening camera (index 0)...")
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("❌ LỖI: Không tìm thấy Camera!")
+        print("[FATAL] Could not open camera. Shutting down.")
+        robot.drive_stop()
         robot.unload()
-        exit()
+        sys.exit(1)
 
-    print("\n==================================================")
-    print(" 🚀 HỆ THỐNG TỰ LÁI (AUTOPILOT GPU) SẴN SÀNG")
-    print("==================================================")
-    print("- Hãy đặt xe vào sa bàn.")
-    print("- Bấm phím 'Q' trên cửa sổ Camera để TẮT KHẨN CẤP.")
-    print("==================================================\n")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    # --- VÒNG LẶP CHÍNH (AUTOPILOT LOOP) ---
+    cv2.namedWindow("RoboGo AutoDrive", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("RoboGo AutoDrive", DISPLAY_W, DISPLAY_H)
+
+    print("[INFO] Autopilot active.  Press Q or ESC in the window to quit.")
+    print("=" * 55)
+
+    # ── Runtime state ─────────────────────────────────────────────────────
+    frame_idx  = 0
+    fps        = 0.0
+    fps_timer  = time.time()
+
+    # ── Main loop ─────────────────────────────────────────────────────────
     try:
         while True:
+            # ── Grab frame ────────────────────────────────────────────────
             ret, frame = cap.read()
-            if not ret:
-                print("❌ LỖI: Tín hiệu camera bị ngắt đột ngột!")
-                break
+            if not ret or frame is None:
+                print("[WARN] Empty camera frame – skipping.")
+                continue
 
-            # 1. TIỀN XỬ LÝ ẢNH
-            # Camera đọc BGR, Model học bằng RGB -> Đổi màu
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb_frame)
-            
-            # Đổi sang Tensor, Thêm chiều Batch [1, C, H, W] và đẩy lên GPU
-            input_tensor = transform(pil_image).unsqueeze(0).to(device)
+            # ── Inference ─────────────────────────────────────────────────
+            tensor = frame_to_tensor(frame, device)
 
-            # 2. AI SUY LUẬN (INFERENCE)
             with torch.no_grad():
-                pred_angle_norm = model(input_tensor).item()
+                prediction = model(tensor)           # shape: (1, 1)
 
-            # Giới hạn góc chuẩn hóa để tránh AI ngáo sinh ra số quá lớn
-            pred_angle_norm = max(-1.0, min(1.0, pred_angle_norm))
-            
-            # Tính toán góc đánh lái thực tế (Độ)
-            steering_angle = pred_angle_norm * MAX_ANGLE
+            # Denormalise: [-1, 1] → [-MAX_ANGLE, MAX_ANGLE] degrees
+            norm_angle = float(prediction.item())
+            norm_angle = float(np.clip(norm_angle, -1.0, 1.0))   # safety clamp
+            angle_deg  = norm_angle * MAX_ANGLE
 
-            # 3. RA LỆNH ĐỘNG CƠ (KÈM DEADZONE)
-            if steering_angle < -DEADZONE:
-                # Rẽ trái (Hàm hãng chỉ nhận số dương nên dùng abs)
-                robot.drive_left(abs(steering_angle))
-                robot.drive_forward(SPEED)
-            elif steering_angle > DEADZONE:
-                # Rẽ phải
-                robot.drive_right(abs(steering_angle))
-                robot.drive_forward(SPEED)
-            else:
-                # Nếu góc nhỏ hơn Deadzone -> Coi như đi thẳng để xe không bị lạng lách
-                robot.servo_comeback_center()
-                robot.drive_forward(SPEED)
+            # ── Robot control with deadzone ────────────────────────────────
+            direction_label = apply_steering(robot, angle_deg)
 
-            # 4. HIỂN THỊ HUD LÊN MÀN HÌNH
-            display_frame = cv2.resize(frame, (320, 240))
-            
-            # Hiển thị text trạng thái
-            cv2.putText(display_frame, "AUTOPILOT: ON (GPU)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(display_frame, f"Angle: {steering_angle:+.1f} deg", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            # Vẽ thanh vô lăng ảo
-            cv2.line(display_frame, (160, 220), (160, 240), (255, 255, 255), 2)
-            steer_offset = int(pred_angle_norm * 100)
-            cv2.circle(display_frame, (160 + steer_offset, 230), 8, (0, 255, 0), -1)
+            # ── FPS calculation (rolling 30-frame average) ─────────────────
+            frame_idx += 1
+            if frame_idx % 30 == 0:
+                now      = time.time()
+                fps      = 30.0 / max(now - fps_timer, 1e-6)
+                fps_timer = now
+                print(f"[DRIVE] frame={frame_idx:06d}  "
+                      f"angle={angle_deg:+6.2f} deg  "
+                      f"({direction_label:20s})  "
+                      f"fps={fps:.1f}")
 
-            cv2.imshow("RoboGo Autodrive", display_frame)
+            # ── HUD overlay ───────────────────────────────────────────────
+            display = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
+            display = draw_hud(display, angle_deg, direction_label,
+                                fps, frame_idx)
+            cv2.imshow("RoboGo AutoDrive", display)
 
-            # Nhấn Q để dừng
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("\n[INFO] Đã nhận lệnh thoát (Phím Q)...")
+            # ── Key input (1 ms poll – keep GUI responsive) ────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), ord('Q'), 27):   # Q or ESC
+                print("[INFO] Quit requested by user.")
                 break
 
     except KeyboardInterrupt:
-        print("\n[INFO] Đã ngắt khẩn cấp bằng Ctrl+C.")
-    except Exception as e:
-        print(f"\n❌ Đã xảy ra lỗi hệ thống: {e}")
+        print("\n[INFO] Interrupted by Ctrl+C.")
+
     finally:
-        # 5. DỌN DẸP & AN TOÀN (Cực kỳ quan trọng)
-        print("[INFO] Đang đóng hệ thống phanh an toàn...")
+        # ── CRITICAL: always stop motors before exit ───────────────────────
+        print("[INFO] Stopping robot...")
         robot.drive_stop()
+        print("[INFO] Unloading robot...")
         robot.unload()
+        print("[INFO] Releasing camera...")
         cap.release()
         cv2.destroyAllWindows()
-        print("✅ Hoàn tất tắt máy. Chúc bạn một ngày vui vẻ!")
+        print(f"[INFO] Autopilot session ended. Total frames processed: {frame_idx}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
