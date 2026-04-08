@@ -36,9 +36,12 @@ from oneai.robogo.robogo_device_solver import RoboGoDeviceSolver
 # ─────────────────────────────────────────────────────────────────────────────
 MODEL_PATH = "robogo_pilotnet.pth"          # trained checkpoint
 
-MAX_ANGLE  = 20         # max steering angle in degrees (hardware limit)
-SPEED      = 30         # forward drive speed sent to motors
-DEADZONE   = 1.0        # ±degrees – within this band, drive straight
+MAX_ANGLE      = 20       # max steering angle in degrees (hardware limit)
+SPEED          = 25       # base forward speed (reduced from 30 for stability)
+MIN_SPEED      = 15       # minimum speed during sharp turns
+DEADZONE       = 2.0      # ±degrees – within this band, drive straight
+STEERING_SCALE = 0.7      # dampen model output (< 1.0 = less aggressive turns)
+EMA_ALPHA      = 0.4      # smoothing factor: 0.0 = full smoothing, 1.0 = no smoothing
 
 CAMERA_ID  = 0          # /dev/video0
 DISPLAY_W  = 320        # HUD preview width
@@ -114,51 +117,65 @@ def predict_steering(model: PilotNet, frame_bgr: np.ndarray) -> float:
     output = model(tensor)                  # shape: (1, 1)
     normalised_angle = output.item()        # scalar in ≈ [-1, 1]
 
-    # Scale to real steering angle in degrees
-    steering_angle = normalised_angle * MAX_ANGLE
+    # Scale to real steering angle in degrees, dampened by STEERING_SCALE
+    steering_angle = normalised_angle * MAX_ANGLE * STEERING_SCALE
     return steering_angle
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper – send motor commands based on predicted angle
 # ─────────────────────────────────────────────────────────────────────────────
-def execute_steering(robot: RoboGoDeviceSolver, angle: float) -> str:
+def compute_adaptive_speed(angle: float) -> int:
+    """
+    Reduce speed proportionally to steering angle.
+    Straight → SPEED,  sharp turn → MIN_SPEED.
+    """
+    ratio = abs(angle) / MAX_ANGLE          # 0.0 (straight) → 1.0 (max turn)
+    ratio = min(ratio, 1.0)
+    speed = int(SPEED - ratio * (SPEED - MIN_SPEED))
+    return max(MIN_SPEED, speed)
+
+
+def execute_steering(robot: RoboGoDeviceSolver, angle: float) -> tuple:
     """
     Translate a steering angle (degrees) into RoboGo API calls.
 
-    Returns a human-readable label for the HUD overlay.
+    Returns (direction_label, actual_speed) for the HUD overlay.
     """
+    speed = compute_adaptive_speed(angle)
+
     if abs(angle) <= DEADZONE:
         # ── Straight ──────────────────────────────────────────────────────
         robot.servo_comeback_center()
-        robot.drive_forward(SPEED)
-        return "STRAIGHT"
+        robot.drive_forward(speed)
+        return "STRAIGHT", speed
     elif angle < 0:
         # ── Left turn ─────────────────────────────────────────────────────
         robot.drive_left(abs(angle))        # API accepts positive values only
-        robot.drive_forward(SPEED)
-        return "LEFT"
+        robot.drive_forward(speed)
+        return "LEFT", speed
     else:
         # ── Right turn ────────────────────────────────────────────────────
         robot.drive_right(abs(angle))       # API accepts positive values only
-        robot.drive_forward(SPEED)
-        return "RIGHT"
+        robot.drive_forward(speed)
+        return "RIGHT", speed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper – draw HUD overlay on the display frame
 # ─────────────────────────────────────────────────────────────────────────────
-def draw_hud(frame: np.ndarray, angle: float, direction: str, fps: float):
+def draw_hud(frame: np.ndarray, angle: float, direction: str,
+             speed: int, fps: float):
     """
     Overlay steering info and status text onto the preview frame.
     """
     # ── Background bar at the top for readability ─────────────────────────
-    cv2.rectangle(frame, (0, 0), (DISPLAY_W, 60), (0, 0, 0), cv2.FILLED)
+    cv2.rectangle(frame, (0, 0), (DISPLAY_W, 70), (0, 0, 0), cv2.FILLED)
 
     # ── "AUTOPILOT: ON" in green ──────────────────────────────────────────
     cv2.putText(
         frame, "AUTOPILOT: ON",
-        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+        (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
         (0, 255, 0), 2, cv2.LINE_AA,
     )
 
@@ -166,8 +183,16 @@ def draw_hud(frame: np.ndarray, angle: float, direction: str, fps: float):
     angle_text = f"Angle: {angle:+6.2f} deg  [{direction}]"
     cv2.putText(
         frame, angle_text,
-        (10, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+        (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
         (255, 255, 255), 1, cv2.LINE_AA,
+    )
+
+    # ── Speed indicator ───────────────────────────────────────────────────
+    speed_text = f"Speed: {speed}"
+    cv2.putText(
+        frame, speed_text,
+        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+        (0, 200, 255), 1, cv2.LINE_AA,
     )
 
     # ── FPS counter (bottom-right) ────────────────────────────────────────
@@ -219,6 +244,7 @@ def main():
         frame_count = 0
         fps = 0.0
         t_start = time.time()
+        smoothed_angle = 0.0         # EMA state
 
         while True:
             ret, frame_bgr = cap.read()
@@ -227,13 +253,16 @@ def main():
                 continue
 
             # ── Predict steering angle ────────────────────────────────────
-            angle = predict_steering(model, frame_bgr)
+            raw_angle = predict_steering(model, frame_bgr)
+
+            # ── EMA smoothing (reduces jitter between frames) ─────────────
+            smoothed_angle = EMA_ALPHA * raw_angle + (1 - EMA_ALPHA) * smoothed_angle
 
             # Clamp to hardware limits (safety)
-            angle = max(-MAX_ANGLE, min(MAX_ANGLE, angle))
+            angle = max(-MAX_ANGLE, min(MAX_ANGLE, smoothed_angle))
 
             # ── Send commands to motors ───────────────────────────────────
-            direction = execute_steering(robot, angle)
+            direction, speed = execute_steering(robot, angle)
 
             # ── FPS calculation ───────────────────────────────────────────
             frame_count += 1
@@ -245,7 +274,7 @@ def main():
 
             # ── HUD display ───────────────────────────────────────────────
             display_frame = cv2.resize(frame_bgr, (DISPLAY_W, DISPLAY_H))
-            draw_hud(display_frame, angle, direction, fps)
+            draw_hud(display_frame, angle, direction, speed, fps)
 
             cv2.imshow("RoboGo AutoPilot", display_frame)
 
