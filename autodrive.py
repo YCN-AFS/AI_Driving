@@ -39,9 +39,9 @@ MODEL_PATH = "robogo_pilotnet.pth"          # trained checkpoint
 MAX_ANGLE      = 20       # max steering angle in degrees (hardware limit)
 SPEED          = 25       # base forward speed (reduced from 30 for stability)
 MIN_SPEED      = 15       # minimum speed during sharp turns
-DEADZONE       = 2.0      # ±degrees – within this band, drive straight
-STEERING_SCALE = 0.7      # dampen model output (< 1.0 = less aggressive turns)
-EMA_ALPHA      = 0.4      # smoothing factor: 0.0 = full smoothing, 1.0 = no smoothing
+DEADZONE       = 1.5      # ±degrees – within this band, drive straight
+STEERING_SCALE = 0.85     # dampen model output (< 1.0 = less aggressive turns)
+EMA_ALPHA      = 0.5      # smoothing factor: 0.0 = full smoothing, 1.0 = no smoothing
 
 CAMERA_ID  = 0          # /dev/video0
 DISPLAY_W  = 320        # HUD preview width
