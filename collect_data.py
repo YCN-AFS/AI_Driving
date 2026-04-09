@@ -26,7 +26,7 @@ from oneai.robogo.robogo_device_solver import RoboGoDeviceSolver
 # ─────────────────────────────────────────────
 MAX_ANGLE   = 20        # degrees, max steering lock
 SPEED       = 30        # motor speed unit
-STEER_STEP  = 4         # degrees incremented per frame while key held
+STEER_STEP  = 2         # degrees incremented per frame (smoother steering data)
 DEBOUNCE_S  = 0.20      # seconds: ignore key-release gaps shorter than this
 FRAME_W     = 320
 FRAME_H     = 240

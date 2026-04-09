@@ -72,7 +72,9 @@ class DrivingDataset(Dataset):
 
     Augmentation (training only):
       • Random horizontal flip  → invert steering angle sign
-      • ColorJitter             → brightness / contrast robustness
+      • ColorJitter             → brightness / contrast / lighting robustness
+      • GaussianBlur            → simulate motion blur & focus variation
+      • Label smoothing         → add small noise to discrete steering values
     """
 
     # Shared resize + tensor + normalise (no randomness – safe for val too)
@@ -82,13 +84,17 @@ class DrivingDataset(Dataset):
         T.Normalize(mean=MEAN, std=STD),
     ])
 
-    # Extra augmentations applied only during training
+    # Stronger augmentations for lighting robustness (single track scenario)
     _color_jitter = T.ColorJitter(
-        brightness=0.3,
-        contrast=0.3,
-        saturation=0.2,
-        hue=0.05,
+        brightness=0.5,         # ↑ from 0.3 – handle sun vs shade
+        contrast=0.5,           # ↑ from 0.3 – handle overcast vs bright
+        saturation=0.3,         # ↑ from 0.2
+        hue=0.08,               # ↑ from 0.05
     )
+    _gaussian_blur = T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))
+
+    # Label smoothing: noise std for steering angle (smooths discrete steps)
+    ANGLE_NOISE_STD = 0.03
 
     def __init__(self, df: pd.DataFrame, augment: bool = False):
         self.df      = df.reset_index(drop=True)
@@ -113,10 +119,50 @@ class DrivingDataset(Dataset):
             # ── Colour jitter (brightness / contrast) ─────────────────────
             img = self._color_jitter(img)
 
+            # ── Gaussian blur (simulate motion / focus variation) ──────────
+            if random.random() > 0.5:
+                img = self._gaussian_blur(img)
+
+            # ── Label smoothing (break discrete 0.2 steps) ────────────────
+            angle += np.random.normal(0, self.ANGLE_NOISE_STD)
+            angle  = float(np.clip(angle, -1.0, 1.0))
+
         img_tensor    = self._base_tf(img)
         angle_tensor  = torch.tensor([angle], dtype=torch.float32)
 
         return img_tensor, angle_tensor
+
+
+def compute_sample_weights(df: pd.DataFrame) -> torch.Tensor:
+    """
+    Compute per-sample weights inversely proportional to steering-angle
+    bin frequency.  Bins with fewer samples (turns) get higher weight,
+    forcing the sampler to draw them more often and fixing the heavy
+    straight-line bias (71.8% angle=0 in the original dataset).
+    """
+    angles = df["steering_angle"].values.astype(float)
+
+    # 5 bins: hard-left | soft-left | straight | soft-right | hard-right
+    bins = [-1.01, -0.3, -0.05, 0.05, 0.3, 1.01]
+    bin_indices = np.digitize(angles, bins) - 1
+    bin_indices = np.clip(bin_indices, 0, len(bins) - 2)
+
+    bin_counts = np.bincount(bin_indices, minlength=len(bins) - 1).astype(float)
+    bin_counts = np.maximum(bin_counts, 1.0)  # avoid division by zero
+
+    # Weight = 1 / count  →  rare bins get higher weight
+    bin_weights = 1.0 / bin_counts
+    sample_weights = bin_weights[bin_indices]
+
+    # Print distribution info
+    labels = ["hard-L", "soft-L", "straight", "soft-R", "hard-R"]
+    print("[INFO] Steering bin distribution & weights:")
+    for i, label in enumerate(labels):
+        cnt = int(bin_counts[i])
+        w   = bin_weights[i]
+        print(f"       {label:>8}: {cnt:>6} samples  (weight={w:.4f})")
+
+    return torch.DoubleTensor(sample_weights)
 
 
 def build_loaders(log_path: str):
@@ -141,13 +187,21 @@ def build_loaders(log_path: str):
 
     print(f"[INFO] Train: {len(train_df)}  |  Val: {len(val_df)}")
 
+    # ── Weighted sampling to fix class imbalance ──────────────────────────
+    sample_weights = compute_sample_weights(train_df)
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights     = sample_weights,
+        num_samples = len(sample_weights),
+        replacement = True,
+    )
+
     train_ds = DrivingDataset(train_df, augment=True)
     val_ds   = DrivingDataset(val_df,   augment=False)
 
     train_loader = DataLoader(
         train_ds,
         batch_size  = BATCH_SIZE,
-        shuffle     = True,
+        sampler     = sampler,             # replaces shuffle=True
         num_workers = NUM_WORKERS,
         pin_memory  = PIN_MEMORY,
         drop_last   = True,

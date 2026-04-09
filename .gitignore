@@ -1,4 +1,10 @@
 .venv
-/.venv
-/my_dataset
-my_dataset
+__pycache__
+
+# Dataset & training data (too large for git)
+my_dataset/
+saved_routes/
+balanced_dataset/
+
+# Model checkpoints
+*.pth

@@ -28,6 +28,7 @@ Usage
     python3 route_recorder.py delete         # delete a route
 """
 
+import csv
 import json
 import os
 import sys
@@ -46,7 +47,7 @@ from oneai.robogo.robogo_device_solver import RoboGoDeviceSolver
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_ANGLE   = 20        # degrees, max steering lock
 SPEED       = 30        # motor speed unit
-STEER_STEP  = 4         # degrees incremented per frame while key held
+STEER_STEP  = 2         # degrees incremented per frame (smoother steering data)
 DEBOUNCE_S  = 0.20      # seconds: ignore key-release gaps shorter than this
 FRAME_W     = 320
 FRAME_H     = 240
@@ -266,23 +267,47 @@ def list_routes() -> List[Dict]:
     ensure_routes_dir()
     routes = []
 
-    for filename in sorted(os.listdir(ROUTES_DIR)):
-        if not filename.endswith(".json"):
+    for entry in sorted(os.listdir(ROUTES_DIR)):
+        entry_path = os.path.join(ROUTES_DIR, entry)
+
+        # Support both old flat JSON and new directory structure
+        if os.path.isdir(entry_path):
+            # New structure: saved_routes/<name>/<name>.json
+            json_file = os.path.join(entry_path, f"{entry}.json")
+            if not os.path.exists(json_file):
+                # Try any .json file in the directory
+                json_files = [f for f in os.listdir(entry_path) if f.endswith(".json")]
+                if not json_files:
+                    continue
+                json_file = os.path.join(entry_path, json_files[0])
+        elif entry.endswith(".json"):
+            # Old flat structure: saved_routes/<name>.json
+            json_file = entry_path
+        else:
             continue
-        filepath = os.path.join(ROUTES_DIR, filename)
+
         try:
-            with open(filepath, "r") as f:
+            with open(json_file, "r") as f:
                 data = json.load(f)
+
+            # Check for training data
+            img_dir = os.path.join(entry_path, "images") if os.path.isdir(entry_path) else None
+            has_training = img_dir is not None and os.path.isdir(img_dir)
+            n_frames = data.get("training_frames", 0)
+
             routes.append({
-                "filename": filename,
-                "filepath": filepath,
-                "name": data.get("name", filename.replace(".json", "")),
+                "filename": os.path.basename(json_file),
+                "filepath": json_file,
+                "dir": entry_path if os.path.isdir(entry_path) else None,
+                "name": data.get("name", entry.replace(".json", "")),
                 "created": data.get("created", "?"),
                 "duration_s": data.get("duration_s", 0),
                 "total_steps": data.get("total_steps", 0),
+                "has_training": has_training,
+                "training_frames": n_frames,
             })
         except (json.JSONDecodeError, IOError):
-            print(f"[WARN] Could not read: {filename}")
+            print(f"[WARN] Could not read: {entry}")
 
     return routes
 
@@ -293,11 +318,12 @@ def print_routes(routes: List[Dict]):
         print("\n  (No saved routes found)")
         return
 
-    print(f"\n{'#':<4} {'Name':<25} {'Duration':<12} {'Steps':<8} {'Created'}")
-    print("─" * 75)
+    print(f"\n{'#':<4} {'Name':<22} {'Duration':<10} {'Steps':<7} {'Frames':<8} {'Created'}")
+    print("─" * 78)
     for i, r in enumerate(routes, 1):
         dur = f"{r['duration_s']:.1f}s"
-        print(f"{i:<4} {r['name']:<25} {dur:<12} {r['total_steps']:<8} {r['created']}")
+        frames = str(r.get('training_frames', 0)) if r.get('has_training') else "—"
+        print(f"{i:<4} {r['name']:<22} {dur:<10} {r['total_steps']:<7} {frames:<8} {r['created']}")
 
 
 def pick_route(prompt: str = "Select route #") -> Optional[Dict]:
@@ -325,7 +351,10 @@ def pick_route(prompt: str = "Select route #") -> Optional[Dict]:
 # RECORD mode
 # ─────────────────────────────────────────────────────────────────────────────
 def record_route():
-    """Record a new route by driving the car with W/A/D keys."""
+    """
+    Record a new route by driving the car with W/A/D keys.
+    Also saves camera frames + driving_log.csv for model training.
+    """
     ensure_routes_dir()
 
     # Get route name
@@ -341,14 +370,21 @@ def record_route():
     # Sanitise name for filename
     safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
 
-    # Check if exists
-    filepath = os.path.join(ROUTES_DIR, f"{safe_name}.json")
-    if os.path.exists(filepath):
+    # Setup directories: saved_routes/<name>/  with images/ subfolder
+    route_dir = os.path.join(ROUTES_DIR, safe_name)
+    img_dir   = os.path.join(route_dir, "images")
+    csv_path  = os.path.join(route_dir, "driving_log.csv")
+    json_path = os.path.join(route_dir, f"{safe_name}.json")
+
+    if os.path.exists(route_dir):
         print(f"  [WARN] Route '{safe_name}' already exists.")
         confirm = input("  Overwrite? (y/N): ").strip().lower()
         if confirm != 'y':
             print("  Cancelled.")
             return
+        shutil.rmtree(route_dir)
+
+    os.makedirs(img_dir, exist_ok=True)
 
     # ── Init robot ────────────────────────────────────────────────────────
     print("\n[INFO] Initializing RoboGo...")
@@ -370,7 +406,13 @@ def record_route():
     cv2.resizeWindow("Route Recorder", 640, 480)
 
     print(f"[INFO] Recording route: '{safe_name}'")
+    print(f"[INFO] Images saved to: {img_dir}")
     print("[INFO] Use W/A/D to drive, S to stop, Q to save & quit.\n")
+
+    # ── Prepare CSV for training data ─────────────────────────────────────
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["image_filename", "steering_angle", "speed"])
 
     commands = []
     current_angle = 0.0
@@ -378,6 +420,7 @@ def record_route():
     last_key_time = 0.0
     is_moving = False
     step_count = 0
+    frame_count = 0
     t_start = time.time()
 
     try:
@@ -427,7 +470,7 @@ def record_route():
                 robot, effective_key, current_angle
             )
 
-            # Record command
+            # Record route command (JSON)
             cmd = {
                 "t": round(elapsed, 4),
                 "action": action,
@@ -436,6 +479,20 @@ def record_route():
             }
             commands.append(cmd)
             step_count += 1
+
+            # ── Save frame + CSV for training (only while moving) ─────────
+            if is_moving:
+                resized = cv2.resize(frame, (FRAME_W, FRAME_H))
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                filename = f"frame_{ts}.jpg"
+                cv2.imwrite(os.path.join(img_dir, filename), resized)
+
+                norm_angle = float(np.clip(current_angle / MAX_ANGLE, -1.0, 1.0))
+                csv_writer.writerow([filename, f"{norm_angle:.4f}", SPEED])
+                frame_count += 1
+
+                if frame_count % 50 == 0:
+                    print(f"[DATA] {frame_count} frames saved.")
 
             # HUD
             display = draw_record_hud(
@@ -452,10 +509,26 @@ def record_route():
         robot.unload()
         cap.release()
         cv2.destroyAllWindows()
+        csv_file.close()
 
-    # Save
+    # Save route JSON
     if commands:
-        save_route(safe_name, commands)
+        duration = commands[-1]["t"] if commands else 0.0
+        route_data = {
+            "name": safe_name,
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "duration_s": round(duration, 2),
+            "total_steps": len(commands),
+            "training_frames": frame_count,
+            "commands": commands,
+        }
+        with open(json_path, "w") as f:
+            json.dump(route_data, f, indent=2)
+
+        print(f"\n[SAVED] Route  : {json_path}")
+        print(f"[SAVED] Images : {frame_count} frames → {img_dir}")
+        print(f"[SAVED] CSV    : {csv_path}")
+        print(f"        Duration: {duration:.1f}s  |  Steps: {len(commands)}")
     else:
         print("[INFO] No commands recorded, nothing saved.")
 
