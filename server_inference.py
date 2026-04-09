@@ -41,7 +41,7 @@ MODEL_PATH     = "robogo_pilotnet.pth"
 
 MAX_ANGLE      = 20
 STEERING_SCALE = 0.85
-EMA_ALPHA      = 0.5
+EMA_ALPHA      = 0.85     # high value needed at ~30fps (vs ~0.1fps local)
 
 # PilotNet input size
 IMG_W, IMG_H = 200, 66
