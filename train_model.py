@@ -37,7 +37,7 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────────────────────────
 # Hyperparameters & Paths
 # ─────────────────────────────────────────────────────────────────────────────
-DATASET_DIR  = "my_dataset"
+DATASET_DIR  = "balanced_dataset"       # use output from tools/balance_dataset.py
 IMG_DIR      = os.path.join(DATASET_DIR, "images")
 LOG_PATH     = os.path.join(DATASET_DIR, "driving_log.csv")
 CHECKPOINT   = "robogo_pilotnet.pth"

@@ -7,4 +7,5 @@ saved_routes/
 balanced_dataset/
 
 # Model checkpoints
-*.pth
+balanced_dataset/
+do-not-use/
