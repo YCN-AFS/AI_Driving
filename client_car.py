@@ -47,7 +47,7 @@ CAMERA_ID  = 0
 JPEG_QUALITY = 80      # JPEG compression (lower = smaller/faster, less detail)
 
 # Network defaults
-DEFAULT_SERVER = "192.168.1.149"
+DEFAULT_SERVER = "192.168.100.149"
 DEFAULT_PORT   = 5555
 
 # Reconnection
